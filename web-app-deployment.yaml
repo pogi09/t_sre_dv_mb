@@ -1,0 +1,125 @@
+---
+# Service: Определяем Service для exposure приложения. Используем тип LoadBalancer для внешнего доступа,
+# предполагая, что это веб-приложение нуждается в публичном доступе. Это обеспечивает балансировку нагрузки
+# между подами. Альтернатива - ClusterIP, если доступ только внутри кластера, но для веб-приложения LoadBalancer подходит.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-service
+spec:
+  selector:
+    app: web-app
+  ports:
+    - protocol: TCP
+      port: 80  # Внешний порт
+      targetPort: 8080  # Порт контейнера
+  type: LoadBalancer
+---
+# Deployment: Основной ресурс для управления подами. Мы стремимся к максимальной отказоустойчивости:
+# - Используем topologySpreadConstraints для равномерного распределения подов по зонам (предполагаем зоны a, b, c).
+#   Это обеспечивает, что поды не концентрируются в одной зоне, минимизируя риск отказа зоны.
+# - PodAntiAffinity: Чтобы избежать размещения нескольких подов на одной ноде, повышая устойчивость к отказу ноды.
+# - Replicas: Устанавливаем начально 1, но управление передаем HPA для autoscaling.
+# - Resources: Requests на минимальном уровне (0.1 CPU, 128M memory) для экономии ресурсов.
+#   Limits: Для CPU выше (1 CPU), чтобы позволить пиковые нагрузки на старте; для memory жестко лимитируем, так как потребление ровно.
+# - Probes: Readiness с initialDelaySeconds=10s, чтобы учесть 5-10s инициализации и не направлять трафик преждевременно.
+#   Liveness для перезапуска в случае зависания.
+# - Strategy: RollingUpdate с maxUnavailable=25% и maxSurge=25%, чтобы минимизировать downtime при обновлениях,
+#   обеспечивая отказоустойчивость.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app-deployment
+spec:
+  replicas: 1  # Начальное значение; HPA будет масштабировать от 1 до 4
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1  # Максимальное отклонение в 1 под между зонами
+        topologyKey: topology.kubernetes.io/zone  # Распределяем по зонам
+        whenUnsatisfiable: DoNotSchedule  # Не размещать, если нельзя равномерно
+        labelSelector:
+          matchLabels:
+            app: web-app
+      affinity:
+        podAntiAffinity:  # Анти-аффинити для распределения по нодам
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - web-app
+              topologyKey: kubernetes.io/hostname  # По нодам
+      containers:
+      - name: web-app-container
+        image: your-image:tag  # Замените на реальный image
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m  # Минимальное ровное потребление
+            memory: 128Mi
+          limits:
+            cpu: 1000m  # Достаточно для пиковых первых запросов
+            memory: 128Mi  # Жесткий лимит, так как потребление стабильно
+        readinessProbe:
+          httpGet:
+            path: /health  # Предполагаемый эндпоинт для проверки; замените если нужно
+            port: 8080
+          initialDelaySeconds: 10  # Учет времени инициализации 5-10s
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 10
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 25%  # Не более 25% подов недоступны во время обновления
+          maxSurge: 25%  # Дополнительно до 25% подов для суржа
+---
+# HorizontalPodAutoscaler: Для autoscaling на основе нагрузки, чтобы минимизировать ресурсы ночью (minReplicas=1)
+# и справляться с пиком днем (maxReplicas=4, как по нагрузочному тесту).
+# Масштабируем по CPU utilization target=50% - это баланс между отзывчивостью и экономией.
+# HPA реагирует на дневной цикл автоматически, масштабируя вверх при росте нагрузки и вниз при падении.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app-deployment
+  minReplicas: 1  # Минимально 1 под ночью для экономии
+  maxReplicas: 4  # Максимум 4, как по тесту
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50  # Цель 50% от requests - позволяет масштабировать при росте
+---
+# PodDisruptionBudget: Для повышения отказоустойчивости - ограничиваем voluntary disruptions (e.g., node drain).
+# maxUnavailable=1 обеспечивает, что не более 1 пода может быть evicted одновременно, предотвращая массовый downtime.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+spec:
+  maxUnavailable: 1  # Или 25%, но фиксированно 1 для простоты в малом масштабе
+  selector:
+    matchLabels:
+      app: web-app
